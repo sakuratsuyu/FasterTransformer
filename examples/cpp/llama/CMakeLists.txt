@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_executable(llama_example_request llama_example_request.cc)
+target_link_libraries(llama_example_request PUBLIC -lcublas -lcublasLt -lcudart
+                      Llama nvtx_utils gpt_example_utils word_list mpi_utils nccl_utils)
+
 add_executable(llama_example llama_example.cc)
 target_link_libraries(llama_example PUBLIC -lcublas -lcublasLt -lcudart
                       Llama nvtx_utils gpt_example_utils word_list mpi_utils nccl_utils)
