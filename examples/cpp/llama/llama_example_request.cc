@@ -32,6 +32,7 @@ using namespace fastertransformer;
 
 template<typename T>
 void llama_example(const INIReader reader);
+
 int read_start_ids(size_t            num_samples,
                    size_t            batch_size,
                    std::vector<int>* v_start_lengths,
@@ -205,28 +206,11 @@ void llama_example(const INIReader reader)
                    max_input_len,
                    end_id,
                    1,
-                   "../examples/cpp/llama/start_ids_request.csv");
+                   "../examples/cpp/llama/start_ids_request.txt");
 
-    int* d_input_ids;
-    int* d_input_lengths;
-    int* d_output_lengths;
-    if (max_input_len == 0) {
-        // unconditional case, no input ids, so do nothing.
-        d_input_ids     = nullptr;
-        d_input_lengths = nullptr;
-        d_output_lengths = nullptr;
-    }
-    else {
-        // conditional case.
-        deviceMalloc(&d_input_ids, num_samples * max_input_len, false);
-        deviceMalloc(&d_input_lengths, num_samples, false);
-        deviceMalloc(&d_output_lengths, num_samples, false);
-        cudaH2Dcpy(d_input_ids, v_start_ids.data(), num_samples * max_input_len);
-        cudaH2Dcpy(d_input_lengths, v_start_lengths.data(), num_samples);
-        cudaH2Dcpy(d_output_lengths, output_lengths.data(), num_samples);
-    }
-    std::vector<int> start_ids(num_samples, start_id);
-    std::vector<int> end_ids(num_samples, end_id);
+
+    std::vector<int> start_ids(request_batch_size, start_id);
+    std::vector<int> end_ids(request_batch_size, end_id);
 
     // Prompt Learning Configurations
     // NOTE: if you don't need prefix prompts, remember to set max_prefix_len to 0 and others to nullptr
@@ -257,10 +241,10 @@ void llama_example(const INIReader reader)
 
     // NOTE: task_name_ids for each sequence in one batch
     // Each sequence can have different prompt learning task ids
-    std::vector<int> prefix_prompt_task_ids(num_samples, 0);
+    std::vector<int> prefix_prompt_task_ids(request_batch_size, 0);
 
     // Set different task ids
-    for (int i = 0; i < num_samples; i++) {
+    for (int i = 0; i < request_batch_size; i++) {
         prefix_prompt_task_ids[i] = (num_tasks > 0) ? i % num_tasks : 0;
     }
 
@@ -354,26 +338,48 @@ void llama_example(const INIReader reader)
                             0,
                             1.0f);
 
-    int* d_output_ids;
-    int* d_sequence_lengths;
+    cudaProfilerStart();
 
-    deviceMalloc(&d_sequence_lengths, num_samples * beam_width, false);
-    
-    double total_time = 0.0f;
-    std::vector<std::unordered_map<std::string, Tensor>> input_tensors_all;
-    std::vector<std::unordered_map<std::string, Tensor>> output_tensors_all;
+    // test time
+    struct timeval start, end;
+    mpi::barrier();
+    cudaDeviceSynchronize();
+    gettimeofday(&start, NULL);
 
-    int sum_output_len = 0;
+    ft_nvtx::setScope("total_time");
+    PUSH_RANGE("total time")
+
+    int prompt_num_tokens = 0;
+    int total_num_tokens = 0;
     for (int i = 0; i < num_samples; i ++) {
+        prompt_num_tokens += v_start_lengths[i];
+        total_num_tokens += v_start_lengths[i] + output_lengths[i];
+    }
 
-        const int total_output_len = max_input_len + output_lengths[i];
-        sum_output_len += total_output_len;
-        deviceMalloc(&d_output_ids, beam_width * total_output_len, false);
+    for (int i = 0; i < num_samples; i ++) {
+        int* d_input_ids;
+        int* d_input_lengths;
+        deviceMalloc(&d_input_ids, request_batch_size * v_start_lengths[i], false);
+        deviceMalloc(&d_input_lengths, request_batch_size, false);
+        cudaH2Dcpy(d_input_ids, &v_start_ids[i], request_batch_size * v_start_lengths[i]);
+        cudaH2Dcpy(d_input_lengths, &v_start_lengths[i], request_batch_size);
+
+        int* d_output_ids;
+        int* d_sequence_lengths;
+
+        const int total_output_len = v_start_lengths[i] + output_lengths[i];
+        total_num_tokens += total_output_len;
+
+        printf("total output len: %d\n", total_output_len);
+        printf("output len: %d\n", output_lengths[i]);
+
+        deviceMalloc(&d_output_ids, request_batch_size * beam_width * total_output_len, false);
+        deviceMalloc(&d_sequence_lengths, request_batch_size * beam_width, false);
 
         std::vector<uint32_t>                   output_seq_len(request_batch_size, total_output_len);
         std::unordered_map<std::string, Tensor> input_tensors = std::unordered_map<std::string, Tensor>{
             {"input_ids",
-            Tensor{MEMORY_GPU, TYPE_INT32, std::vector<size_t>{request_batch_size, (size_t)max_input_len}, d_input_ids + max_input_len * i}},
+            Tensor{MEMORY_GPU, TYPE_INT32, std::vector<size_t>{request_batch_size, (size_t)v_start_lengths[i]}, d_input_ids}},
             {"input_lengths", Tensor{MEMORY_GPU, TYPE_INT32, std::vector<size_t>{request_batch_size}, d_input_lengths}},
             // NOTE: if you need prefix prompts, remember to add prefix_prompt_task_ids here
             // {"prompt_learning_task_name_ids", Tensor{MEMORY_CPU, TYPE_INT32, std::vector<size_t>{request_batch_size},
@@ -401,7 +407,7 @@ void llama_example(const INIReader reader)
             // Prefix Prompt Task Name Ids here
             input_tensors.insert(
                 {"prompt_learning_task_name_ids",
-                Tensor{MEMORY_CPU, TYPE_INT32, std::vector<size_t>{num_samples}, prefix_prompt_task_ids.data()}});
+                Tensor{MEMORY_CPU, TYPE_INT32, std::vector<size_t>{request_batch_size}, prefix_prompt_task_ids.data()}});
         }
 
         if (top_k == 0 && top_p == 0.0f) {
@@ -430,153 +436,102 @@ void llama_example(const INIReader reader)
             {"output_log_probs",
             Tensor{MEMORY_GPU,
                     TYPE_FP32,
-                    std::vector<size_t>{(size_t)output_lengths[0], request_batch_size, beam_width},
+                    std::vector<size_t>{(size_t)output_lengths[i], request_batch_size, beam_width},
                     nullptr}}};
 
-        input_tensors_all.emplace_back(input_tensors);
-        output_tensors_all.emplace_back(output_tensors);
+        print_mem_usage();
 
-        // warm up
-        gpt.forward(&output_tensors_all[i], &input_tensors_all[i], &gpt_weights);
+        cudaDeviceSynchronize();
+        mpi::barrier();
 
-        struct timeval start, end;
-        gettimeofday(&start, NULL);
-        gpt.forward(&output_tensors_all[i], &input_tensors_all[i], &gpt_weights);
-        gettimeofday(&end, NULL);
-        total_time += ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) * 0.001);
+        gpt.forward(&output_tensors, &input_tensors, &gpt_weights);
 
+        cudaDeviceSynchronize();
+        mpi::barrier();
+
+        if (d_input_ids != nullptr) {
+            cudaFree(d_input_ids);
+        }
+        if (d_input_lengths != nullptr) {
+            cudaFree(d_input_lengths);
+        }
         if (d_output_ids != nullptr) {
             deviceFree(d_output_ids);
         }
+        if (d_sequence_lengths != nullptr) {
+            deviceFree(d_sequence_lengths);
+        }
     }
 
-    printf("[INFO] num_samples %ld request_batch_size %ld beam_width %ld head_num %ld size_per_head %ld total_output_len %d"
-        " decoder_layers %ld vocab_size %ld FT-CPP-decoding-beamsearch-time %.2f ms\n",
-        num_samples,
-        request_batch_size,
-        beam_width,
-        head_num,
-        size_per_head,
-        sum_output_len,
-        decoder_layers,
-        vocab_size,
-        total_time / num_samples);
+    POP_RANGE;
+    ft_nvtx::resetScope();
+    gettimeofday(&end, NULL);
 
-    return;
+    cudaProfilerStop();
 
-    // print_mem_usage();
+    // if (rank == 0) {
 
-    // int ite = 1;
-    // cudaDeviceSynchronize();
-    // mpi::barrier();
+    //     std::string fName   = "out";
+    //     auto        outFile = std::ofstream(fName, std::ios::out);
+    //     if (!outFile.is_open()) {
+    //         printf("[WARNING] Cannot write results into output file %s \n", fName.c_str());
+    //     }
+    //     else {
+    //         size_t outCount = total_output_len * request_batch_size * beam_width;
+    //         int*   hBuf     = new int[outCount];
 
-    // cudaProfilerStart();
-    // // warm up
-    // ite = num_samples;
-    // ft_nvtx::setScope("warmup_time");
-    // PUSH_RANGE("warmup time")
+    //         cudaD2Hcpy(hBuf, d_output_ids, outCount);
 
-    // for (int i = 0; i < ite; ++i) {
-    //     gpt.forward(&output_tensors_all[i], &input_tensors_all[i], &gpt_weights);
+    //         {
+    //             std::cout << "Writing " << outCount << " elements\n";
+    //             int zeroCount = 0;
+    //             for (size_t i = 0; i < outCount; i++) {
+    //                 if (hBuf[i] == int(0)) {
+    //                     zeroCount++;
+    //                 }
+    //                 outFile << hBuf[i] << ", ";
+    //                 if ((i + 1) % (total_output_len) == 0) {
+    //                     outFile << std::endl;
+    //                 }
+
+    //                 if (i < 10) {
+    //                     printf("%5d ", hBuf[i]);
+    //                 }
+    //                 if ((i + 1) % (total_output_len) == 0 && i < 10) {
+    //                     std::cout << std::endl;
+    //                 }
+    //             }
+    //             std::cout << std::endl << "zeroCount = " << zeroCount << std::endl;
+    //         }
+    //         delete[] hBuf;
+    //     }
     // }
 
-    // cudaDeviceSynchronize();
-    // mpi::barrier();
+    printf("[INFO] request_batch_size %ld beam_width %ld head_num %ld size_per_head %ld total_output_len %d"
+           " decoder_layers %ld vocab_size %ld FT-CPP-decoding-beamsearch-time %.2f ms\n",
+           request_batch_size,
+           beam_width,
+           head_num,
+           size_per_head,
+           total_num_tokens,
+           decoder_layers,
+           vocab_size,
+           ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) * 0.001) / num_samples);
+    
+    double total_time = ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) * 0.001) / 1000;
+    printf("Throughput: %.2lf request/s\n", (double)(num_samples) / total_time);
+    printf("Tokens/s: %.2lf tokens/s\n", (double)(total_num_tokens) / total_time);
+    printf("Prompt_num_tokens: %d\n", prompt_num_tokens);
+    printf("Total_num_tokens: %d\n", total_num_tokens);
 
-    // POP_RANGE;
-    // ft_nvtx::resetScope();
+    ftNcclParamDestroy(tensor_para);
+    ftNcclParamDestroy(pipeline_para);
 
+    delete cublas_algo_map;
+    delete cublas_wrapper_mutex;
 
-    // // if (rank == 0) {
-
-    // //     std::string fName   = "out";
-    // //     auto        outFile = std::ofstream(fName, std::ios::out);
-    // //     if (!outFile.is_open()) {
-    // //         printf("[WARNING] Cannot write results into output file %s \n", fName.c_str());
-    // //     }
-    // //     else {
-    // //         size_t outCount = total_output_len * num_samples * beam_width;
-    // //         int*   hBuf     = new int[outCount];
-
-    // //         cudaD2Hcpy(hBuf, d_output_ids, outCount);
-
-    // //         {
-    // //             std::cout << "Writing " << outCount << " elements\n";
-    // //             int zeroCount = 0;
-    // //             for (size_t i = 0; i < outCount; i++) {
-    // //                 if (hBuf[i] == int(0)) {
-    // //                     zeroCount++;
-    // //                 }
-    // //                 outFile << hBuf[i] << " ";
-    // //                 if ((i + 1) % (total_output_len) == 0) {
-    // //                     outFile << std::endl;
-    // //                 }
-
-    // //                 if (i < 10) {
-    // //                     printf("%5d ", hBuf[i]);
-    // //                 }
-    // //                 if ((i + 1) % (total_output_len) == 0 && i < 10) {
-    // //                     std::cout << std::endl;
-    // //                 }
-    // //             }
-    // //             std::cout << std::endl << "zeroCount = " << zeroCount << std::endl;
-    // //         }
-    // //         delete[] hBuf;
-    // //     }
-    // // }
-
-    // // test time
-    // struct timeval start, end;
-    // mpi::barrier();
-    // cudaDeviceSynchronize();
-    // gettimeofday(&start, NULL);
-
-    // ft_nvtx::setScope("total_time");
-    // PUSH_RANGE("total time")
-    // for (int i = 0; i < ite; ++i) {
-    //     gpt.forward(&output_tensors_all[i], &input_tensors_all[i], &gpt_weights);
-    // }
-    // cudaDeviceSynchronize();
-    // mpi::barrier();
-
-    // POP_RANGE;
-    // ft_nvtx::resetScope();
-    // gettimeofday(&end, NULL);
-
-    // cudaProfilerStop();
-
-    // printf("[INFO] num_samples %ld request_batch_size %ld beam_width %ld head_num %ld size_per_head %ld total_output_len %d"
-    //        " decoder_layers %ld vocab_size %ld FT-CPP-decoding-beamsearch-time %.2f ms\n",
-    //        num_samples,
-    //        request_batch_size,
-    //        beam_width,
-    //        head_num,
-    //        size_per_head,
-    //        total_output_len,
-    //        decoder_layers,
-    //        vocab_size,
-    //        ((end.tv_sec - start.tv_sec) * 1000 + (end.tv_usec - start.tv_usec) * 0.001) / ite);
-
-    // ftNcclParamDestroy(tensor_para);
-    // ftNcclParamDestroy(pipeline_para);
-
-    // delete cublas_algo_map;
-    // delete cublas_wrapper_mutex;
-
-    // cudaFree(d_bad_words);
-    // cudaFree(d_stop_words);
-    // if (d_input_ids != nullptr) {
-    //     cudaFree(d_input_ids);
-    // }
-    // if (d_input_lengths != nullptr) {
-    //     cudaFree(d_input_lengths);
-    // }
-    // if (d_output_ids != nullptr) {
-    //     deviceFree(d_output_ids);
-    // }
-    // if (d_sequence_lengths != nullptr) {
-    //     deviceFree(d_sequence_lengths);
-    // }
+    cudaFree(d_bad_words);
+    cudaFree(d_stop_words);
     return;
 }
 
@@ -610,15 +565,15 @@ int read_start_ids(size_t            num_samples,
 
             std::getline(start_id_file, line);
             int prompt_length = std::stoi(line);
-            printf("%d ", prompt_length);
+            // printf("%d ", prompt_length);
             std::getline(start_id_file, line);
             int output_length = std::stoi(line);
-            printf("%d ", output_length);
+            // printf("%d ", output_length);
 
-            for (int e : tmp_vec) {
-                printf("%d, ", e);
-            }
-            printf("\n");
+            // for (int e : tmp_vec) {
+            //     printf("%d, ", e);
+            // }
+            // printf("\n");
 
             tmp_start_ids.push_back(tmp_vec);
             tmp_start_lengths.push_back(i1);

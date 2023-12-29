@@ -454,7 +454,7 @@ void llama_example(const INIReader reader)
                     if (hBuf[i] == int(0)) {
                         zeroCount++;
                     }
-                    outFile << hBuf[i] << " ";
+                    outFile << hBuf[i] << ", ";
                     if ((i + 1) % (total_output_len) == 0) {
                         outFile << std::endl;
                     }
